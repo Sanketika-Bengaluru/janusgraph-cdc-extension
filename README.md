@@ -111,26 +111,78 @@ log.learning_graph_events.read-interval=500
 
 ## Step 4: Configure Bootstrap Script
 
-The bootstrap script (`empty-sample.groovy`) is already configured to:
+The bootstrap script (`scripts/register-cdc.groovy`) is configured to:
 1. Load the `GraphLogProcessor` class
 2. Start it with the server's graph instance
-3. Pass Kafka configuration
+3. Pass Configuration (Sinks, Converters, Kafka)
 
-**Location**: `/opt/janusgraph/scripts/empty-sample.groovy`
+**Location**: `/opt/janusgraph/scripts/register-cdc.groovy`
 
-**Key Configuration**:
+**Configuration**:
+You can modify the configuration map in the script:
+
 ```groovy
-def config = [
-    "graph.txn.log_processor.enable": "true",
-    "kafka.bootstrap.servers": "kafka:29092",
-    "kafka.topics.graph.event": "sunbirddev.learning.graph.events"
-]
-GraphLogProcessor.start(graphInstance, config)
+Map<String, Object> config = new HashMap<>();
+// Sinks: KAFKA, LOG
+config.put("graph.txn.log_processor.sinks", "KAFKA,LOG"); 
+// Converter: TELEMETRY (Custom), DEFAULT (Legacy)
+config.put("graph.txn.log_processor.converter", "TELEMETRY"); 
+config.put("kafka.bootstrap.servers", "localhost:9092");
+config.put("kafka.topics.graph.event", "sunbirddev.learning.graph.events");
+
+GraphLogProcessor.start(graphInstance, config);
 ```
 
 ---
 
-## Step 5: Restart JanusGraph Server
+## Step 5: Configure Logging (Optional)
+
+If you enabled the **LOG** sink, events are written to the standard JanusGraph server log by default.
+To write these events to a separate file, you need to add an Appender and Logger to your `/opt/janusgraph/conf/log4j2-server.xml`.
+
+**Example Configuration (`src/main/resources/log4j2-server.xml`)**:
+
+```xml
+<Configuration>
+    <Appenders>
+        <!-- Existing Appenders... -->
+        
+        <!-- CDC Appender -->
+        <RollingFile name="CDC_LOG" fileName="/opt/janusgraph/logs/cdc-events.log"
+                     filePattern="/opt/janusgraph/logs/cdc-events-%d{yyyy-MM-dd}.log.gz">
+            <PatternLayout pattern="%d{ISO8601} %msg%n"/>
+            <Policies>
+                <TimeBasedTriggeringPolicy />
+                <SizeBasedTriggeringPolicy size="100 MB"/>
+            </Policies>
+        </RollingFile>
+    </Appenders>
+    <Loggers>
+        <!-- Existing Loggers... -->
+        
+        <!-- CDC Logger -->
+        <Logger name="org.sunbird.janusgraph.cdc.LogFileEventSink" level="info" additivity="false">
+            <AppenderRef ref="CDC_LOG"/>
+        </Logger>
+    </Loggers>
+</Configuration>
+```
+
+To apply this in Docker:
+```bash
+docker cp src/main/resources/log4j2-server.xml sunbird_janusgraph:/opt/janusgraph/conf/
+docker exec sunbird_janusgraph mkdir -p /opt/janusgraph/logs
+docker restart sunbird_janusgraph
+```
+
+You can then tail the logs:
+```bash
+docker exec sunbird_janusgraph tail -f /opt/janusgraph/logs/cdc-events.log
+```
+
+---
+
+## Step 6: Restart JanusGraph Server
 
 ```bash
 docker restart sunbird_janusgraph
@@ -144,7 +196,7 @@ docker logs sunbird_janusgraph | grep "GraphLogProcessor started successfully"
 
 Expected output:
 ```
-INFO  org.sunbird.janusgraph.cdc.GraphLogProcessor.start - GraphLogProcessor started successfully.
+INFO  org.sunbird.janusgraph.cdc.GraphLogProcessor - GraphLogProcessor started successfully with 2 sinks.
 ```
 
 ---

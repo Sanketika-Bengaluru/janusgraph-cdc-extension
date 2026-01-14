@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Configuration status="warn">
+    <Appenders>
+        <Console name="STDOUT" target="SYSTEM_OUT">
+            <PatternLayout pattern="%d{HH:mm:ss} %-5level %class.%method{36} - %msg%n"/>
+        </Console>
+        <!-- CDC Appender -->
+        <RollingFile name="CDC_LOG" fileName="/opt/janusgraph/logs/cdc-events.log"
+                     filePattern="/opt/janusgraph/logs/cdc-events-%d{yyyy-MM-dd}.log.gz">
+            <PatternLayout pattern="%d{ISO8601} %msg%n"/>
+            <Policies>
+                <TimeBasedTriggeringPolicy />
+                <SizeBasedTriggeringPolicy size="100 MB"/>
+            </Policies>
+        </RollingFile>
+    </Appenders>
+    <Loggers>
+        <Logger name="org.apache.hadoop.hbase" level="warn">
+            <AppenderRef ref="STDOUT"/>
+        </Logger>
+        
+        <!-- CDC Logger -->
+        <Logger name="org.sunbird.janusgraph.cdc.LogFileEventSink" level="info" additivity="false">
+            <AppenderRef ref="CDC_LOG"/>
+        </Logger>
+
+        <Root level="info">
+            <AppenderRef ref="STDOUT"/>
+        </Root>
+    </Loggers>
+</Configuration>

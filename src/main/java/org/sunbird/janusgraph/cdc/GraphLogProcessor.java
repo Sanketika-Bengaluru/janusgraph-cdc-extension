@@ -6,7 +6,6 @@ import org.janusgraph.core.JanusGraph;
 import org.janusgraph.core.JanusGraphFactory;
 import org.janusgraph.core.JanusGraphTransaction;
 import org.janusgraph.core.JanusGraphVertex;
-import org.janusgraph.core.JanusGraphVertexProperty;
 import org.janusgraph.core.log.Change;
 import org.janusgraph.core.log.ChangeProcessor;
 import org.janusgraph.core.log.ChangeState;
@@ -17,21 +16,24 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
-import java.util.HashMap;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 
 /**
  * GraphLogProcessor running inside JanusGraph Server.
- * Listens to "learning_graph_events" user log and publishes changes to Kafka.
+ * Listens to "learning_graph_events" user log and publishes changes to
+ * configured sinks.
  */
 public class GraphLogProcessor {
 
     private static final Logger logger = LoggerFactory.getLogger(GraphLogProcessor.class);
     private static final String LOG_IDENTIFIER = "learning_graph_events";
     private static final ObjectMapper mapper = new ObjectMapper();
-    
-    private static KafkaEventProducer kafkaProducer;
+
+    // Configurable components
+    private static List<EventSink> sinks = new ArrayList<>();
+    private static MessageConverter converter;
     private static boolean isStarted = false;
 
     public static synchronized void start(JanusGraph graph, Map<String, Object> config) {
@@ -41,22 +43,48 @@ public class GraphLogProcessor {
         }
 
         // Configuration passed from script
-        boolean enableProcessor = Boolean.parseBoolean(String.valueOf(config.getOrDefault("graph.txn.log_processor.enable", "false")));
+        boolean enableProcessor = Boolean
+                .parseBoolean(String.valueOf(config.getOrDefault("graph.txn.log_processor.enable", "false")));
         if (!enableProcessor) {
             logger.info("GraphLogProcessor is disabled by config.");
             return;
         }
 
-        String kafkaServers = (String) config.getOrDefault("kafka.bootstrap.servers", "localhost:9092");
-        String kafkaTopic = (String) config.getOrDefault("kafka.topics.graph.event", "sunbirddev.learning.graph.events");
-
         logger.info("Starting GraphLogProcessor...");
-        logger.info("Kafka Bootstrap Servers: {}", kafkaServers);
-        logger.info("Kafka Topic: {}", kafkaTopic);
+
+        // INitialize Converter
+        String converterType = (String) config.getOrDefault("graph.txn.log_processor.converter", "DEFAULT");
+        if ("TELEMETRY".equalsIgnoreCase(converterType)) {
+            converter = new TelemetryMessageConverter();
+            logger.info("Using TelemetryMessageConverter");
+        } else {
+            converter = new SimpleMessageConverter();
+            logger.info("Using SimpleMessageConverter");
+        }
+
+        // Initialize Sinks
+        sinks.clear();
+        String sinksConfig = (String) config.getOrDefault("graph.txn.log_processor.sinks", "KAFKA"); // Default to KAFKA
+        String[] sinkTypes = sinksConfig.split(",");
+
+        for (String sinkType : sinkTypes) {
+            if ("KAFKA".equalsIgnoreCase(sinkType.trim())) {
+                String kafkaServers = (String) config.getOrDefault("kafka.bootstrap.servers", "localhost:9092");
+                String kafkaTopic = (String) config.getOrDefault("kafka.topics.graph.event",
+                        "sunbirddev.learning.graph.events");
+                sinks.add(new KafkaEventSink(kafkaServers, kafkaTopic));
+                logger.info("Added Kafka Event Sink (Topic: {})", kafkaTopic);
+            } else if ("LOG".equalsIgnoreCase(sinkType.trim())) {
+                sinks.add(new LogFileEventSink());
+                logger.info("Added Log File Event Sink");
+            }
+        }
+
+        if (sinks.isEmpty()) {
+            logger.warn("No sinks configured. Processor will consume logs but output nowhere.");
+        }
 
         try {
-            kafkaProducer = new KafkaEventProducer(kafkaServers, kafkaTopic);
-
             LogProcessorFramework framework = JanusGraphFactory.openTransactionLog(graph);
             framework.addLogProcessor(LOG_IDENTIFIER)
                     .setProcessorIdentifier("janusgraph-cdc-processor")
@@ -75,7 +103,7 @@ public class GraphLogProcessor {
                     .build();
 
             isStarted = true;
-            logger.info("GraphLogProcessor started successfully.");
+            logger.info("GraphLogProcessor started successfully with {} sinks.", sinks.size());
 
         } catch (Exception e) {
             logger.error("Failed to start GraphLogProcessor", e);
@@ -87,7 +115,7 @@ public class GraphLogProcessor {
         for (JanusGraphVertex vertex : changeState.getVertices(Change.ADDED)) {
             processVertexChange(vertex, "CREATE", txId);
         }
-        
+
         for (JanusGraphVertex vertex : changeState.getVertices(Change.REMOVED)) {
             processVertexChange(vertex, "DELETE", txId);
         }
@@ -95,50 +123,35 @@ public class GraphLogProcessor {
 
     private static void processVertexChange(JanusGraphVertex vertex, String operationType, TransactionId txId) {
         try {
-            // Filter logic: Only process "DATA_NODE" or specific types if needed
-            // For now, capture all.
-            
-            // Note: For REMOVED vertices, properties might not be accessible if they are wiped.
-            // ChangeState should provide the state of the vertex.
-            
-            Map<String, Object> event = new HashMap<>();
-            event.put("nodeGraphId", "domain"); // Hardcoded or derived
-            event.put("nodeUniqueId", vertex.id().toString()); // Internal ID, or property 'IL_UNIQUE_ID'
-            event.put("operationType", operationType);
-            event.put("timestamp", System.currentTimeMillis());
-            event.put("txId", txId.toString());
-
-            // Extract Label
-            event.put("objectType", vertex.label());
-
-            // Extract Properties
-            // For CREATE, we want full snapshot.
-            if ("CREATE".equals(operationType)) {
-               Map<String, Object> properties = new HashMap<>();
-               vertex.properties().forEachRemaining(p -> {
-                   properties.put(p.key(), p.value());
-               });
-               event.put("properties", properties);
-               
-               // Try to find a better unique ID if available
-               if (properties.containsKey("IL_UNIQUE_ID")) {
-                   event.put("nodeUniqueId", properties.get("IL_UNIQUE_ID"));
-               }
-            }
-
+            // Convert message
+            Map<String, Object> event = converter.convert(vertex, operationType, txId);
             String json = mapper.writeValueAsString(event);
-            kafkaProducer.send(vertex.id().toString(), json);
-            logger.debug("Published event: {}", json);
+            String key = vertex.id().toString();
+
+            // Send to all sinks
+            for (EventSink sink : sinks) {
+                try {
+                    sink.send(key, json);
+                } catch (Exception e) {
+                    logger.error("Error sending event to sink: {}", sink.getClass().getSimpleName(), e);
+                }
+            }
+            logger.debug("Processed event: {}", json);
 
         } catch (Exception e) {
-            logger.error("Error converting/sending vertex change event", e);
+            logger.error("Error converting/processing vertex change event", e);
         }
     }
 
     public static synchronized void shutdown() {
-        if (kafkaProducer != null) {
-            kafkaProducer.close();
+        for (EventSink sink : sinks) {
+            try {
+                sink.close();
+            } catch (Exception e) {
+                logger.warn("Error closing sink", e);
+            }
         }
+        sinks.clear();
         isStarted = false;
         logger.info("GraphLogProcessor stopped.");
     }
