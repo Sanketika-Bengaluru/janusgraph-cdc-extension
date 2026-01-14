@@ -1,4 +1,4 @@
-# JanusGraph CDC Log Processor - Complete Setup Guide
+# JanusGraph CDC Log Processor - Setup Guide
 
 ## Overview
 
