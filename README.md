@@ -1,4 +1,4 @@
-# JanusGraph CDC Log Processor - Complete Setup Guide
+# JanusGraph CDC Log Processor - Setup Guide
 
 ## Overview
 
@@ -239,75 +239,6 @@ Expected output (JSON):
 
 ---
 
-## Verification: JAR vs Application Thread
-
-### Confirm JAR is Publishing (Not Application)
-
-**1. Check JanusGraph Server Logs** (where JAR runs):
-```bash
-docker logs sunbird_janusgraph | grep "Published event"
-```
-
-**2. Check Application Logs** (should have NO Kafka publishing):
-```bash
-docker logs content-service | grep -i kafka
-```
-
-**Expected**: Application logs should NOT show Kafka publishing activity. All Kafka interactions happen in JanusGraph Server logs.
-
-**3. Verify Separate Thread**:
-```bash
-docker exec sunbird_janusgraph jps -l
-```
-
-You'll see JanusGraph Server process. The `GraphLogProcessor` runs as a background thread within this process.
-
----
-
-## Architecture Confirmation
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│ Application Container (content-service)                      │
-│                                                               │
-│  NodeAsyncOperations.java                                    │
-│    ↓ (if TXN_LOG_ENABLED)                                    │
-│  tx = graph.buildTransaction()                               │
-│         .logIdentifier("learning_graph_events")              │
-│         .start()                                              │
-│    ↓                                                          │
-│  tx.commit() ← Tags transaction, NO Kafka code here          │
-└───────────────────────────┬───────────────────────────────────┘
-                            │ Gremlin Server Protocol
-                            ↓
-┌─────────────────────────────────────────────────────────────┐
-│ JanusGraph Server Container (sunbird_janusgraph)             │
-│                                                               │
-│  ┌─────────────────────────────────────────────────────────┐ │
-│  │ Transaction Log (Cassandra Backend)                     │ │
-│  │   - Stores: learning_graph_events                       │ │
-│  └─────────────────────────────────────────────────────────┘ │
-│                            ↑                                  │
-│                            │ (write)                          │
-│                            │                                  │
-│  ┌─────────────────────────────────────────────────────────┐ │
-│  │ GraphLogProcessor JAR (Separate Thread)                 │ │
-│  │   - Polls transaction log every 500ms                   │ │
-│  │   - Processes CREATE/DELETE events                      │ │
-│  │   - Serializes to JSON                                  │ │
-│  │   - Publishes to Kafka ← ALL KAFKA CODE HERE            │ │
-│  └─────────────────────────────────────────────────────────┘ │
-└───────────────────────────┬───────────────────────────────────┘
-                            │
-                            ↓
-                    ┌───────────────┐
-                    │ Kafka         │
-                    │ Topic: ...    │
-                    └───────────────┘
-```
-
----
-
 ## Troubleshooting
 
 ### No Events in Kafka?
@@ -341,19 +272,3 @@ Edit `GraphLogProcessor.java` → `processVertexChange()` method to adjust prope
 - Reduce `log.learning_graph_events.read-interval` for faster polling
 - Monitor Kafka producer metrics in JanusGraph logs
 - Consider batching for high-volume scenarios
-
----
-
-## Summary
-
-✅ **JAR-Based**: CDC processor runs in JanusGraph Server, not application  
-✅ **Zero Application Code**: Application only tags transactions with `logIdentifier`  
-✅ **Asynchronous**: Events published to Kafka in background thread  
-✅ **At-Least-Once**: Delivery guarantee (events may be duplicated on replay)  
-✅ **Configurable**: Easy to enable/disable via configuration  
-
-**Key Files**:
-- JAR: `/opt/janusgraph/lib/janusgraph-cdc-extension-1.0-SNAPSHOT.jar`
-- Config: `/opt/janusgraph/conf/janusgraph-cql-server.properties`
-- Bootstrap: `/opt/janusgraph/scripts/empty-sample.groovy`
-- App Config: `content-api/content-service/conf/application.conf`
