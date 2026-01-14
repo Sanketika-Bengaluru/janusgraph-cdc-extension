@@ -20,6 +20,19 @@ Application → JanusGraph Server (with logIdentifier)
 
 ---
 
+## Project Structure
+
+- **`src/main/java`**: Contains the Java source code for the extension.
+    - `GraphLogProcessor.java`: The core logic for processing transaction logs.
+    - `KafkaEventProducer.java`: Handles publishing events to Kafka.
+- **`scripts/`**: Contains Groovy scripts for JanusGraph.
+    - `register-cdc.groovy`: Script to register the CDC processor with JanusGraph.
+    - `empty-sample.groovy`: Sample bootstrap script.
+- **`.github/workflows`**: CI/CD pipeline definitions.
+- **`pom.xml`**: Maven build configuration.
+
+---
+
 ## Prerequisites
 
 - JanusGraph Server 1.1.0 (running in Docker)
@@ -33,15 +46,15 @@ Application → JanusGraph Server (with logIdentifier)
 
 ### 1.1 Navigate to Project
 ```bash
-cd /Users/sanketikam4/January/knowledge-platform
+cd janusgraph-cdc-extension
 ```
 
 ### 1.2 Build the JAR
 ```bash
-mvn clean package -pl platform-tools/janusgraph-cdc-extension -DskipTests
+mvn clean package -DskipTests
 ```
 
-**Output**: `platform-tools/janusgraph-cdc-extension/target/janusgraph-cdc-extension-1.0-SNAPSHOT.jar`
+**Output**: `target/janusgraph-cdc-extension-1.0-SNAPSHOT.jar`
 
 **What this JAR contains**:
 - `GraphLogProcessor.java` - Main processor that reads transaction logs
@@ -54,7 +67,7 @@ mvn clean package -pl platform-tools/janusgraph-cdc-extension -DskipTests
 
 ### 2.1 Copy JAR to Container
 ```bash
-docker cp platform-tools/janusgraph-cdc-extension/target/janusgraph-cdc-extension-1.0-SNAPSHOT.jar \
+docker cp janusgraph-cdc-extension/target/janusgraph-cdc-extension-1.0-SNAPSHOT.jar \
   sunbird_janusgraph:/opt/janusgraph/lib/
 ```
 
