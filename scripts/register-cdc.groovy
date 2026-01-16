@@ -46,7 +46,7 @@ try {
         // USER: You can configure the CDC processor here
         config.put("graph.txn.log_processor.enable", "true");
         config.put("graph.txn.log_processor.sinks", "KAFKA,LOG");
-        config.put("graph.txn.log_processor.converter", "TELEMETRY");
+        config.put("graph.txn.log_processor.converter", "SUNBIRD_LEGACY");
         
         // Kafka Configs (Optional if using defaults)
         config.put("kafka.bootstrap.servers", "kafka:29092");

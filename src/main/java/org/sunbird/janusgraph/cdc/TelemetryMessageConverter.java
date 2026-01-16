@@ -1,6 +1,7 @@
 package org.sunbird.janusgraph.cdc;
 
 import org.janusgraph.core.JanusGraphVertex;
+import org.janusgraph.core.log.ChangeState;
 import org.janusgraph.core.log.TransactionId;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -14,7 +15,8 @@ public class TelemetryMessageConverter implements MessageConverter {
     private static final Logger logger = LoggerFactory.getLogger(TelemetryMessageConverter.class);
 
     @Override
-    public Map<String, Object> convert(JanusGraphVertex vertex, String operationType, TransactionId txId) {
+    public Map<String, Object> convert(JanusGraphVertex vertex, ChangeState changeState, String operationType,
+            TransactionId txId) {
         long ets = System.currentTimeMillis();
         String mid = "LP." + ets + "." + UUID.randomUUID();
 

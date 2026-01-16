@@ -4,19 +4,7 @@
 
 The JanusGraph CDC (Change Data Capture) Log Processor is a **standalone JAR** that runs **inside JanusGraph Server**. It automatically captures graph mutations and publishes them to Kafka **without requiring any application code changes**.
 
-### How It Works
-
-```
-Application → JanusGraph Server (with logIdentifier)
-                    ↓
-            Transaction Log (Cassandra)
-                    ↓
-            GraphLogProcessor JAR (polls log)
-                    ↓
-            Kafka Topic (events published)
-```
-
-**Key Point**: The JAR runs in a separate thread inside JanusGraph Server, not in your application. Your application only needs to tag transactions with a `logIdentifier`.
+**Key Point**: The JAR runs in a separate thread inside JanusGraph Server, not in knowledge-platform. knowledge-platform only needs to tag transactions with a `logIdentifier`.
 
 ---
 
@@ -204,7 +192,7 @@ INFO  org.sunbird.janusgraph.cdc.GraphLogProcessor - GraphLogProcessor started s
 ## Step 6: Configure Your Application
 
 ### 6.1 Enable Transaction Logging
-Add to your application configuration (e.g., `application.conf`):
+Add to knowledge-platform configuration (e.g., `application.conf`):
 
 ```hocon
 graph.txn.enable_log = true

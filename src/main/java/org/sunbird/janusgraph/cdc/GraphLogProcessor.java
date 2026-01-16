@@ -1,11 +1,12 @@
 package org.sunbird.janusgraph.cdc;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.tinkerpop.gremlin.structure.Vertex;
+
 import org.janusgraph.core.JanusGraph;
 import org.janusgraph.core.JanusGraphFactory;
 import org.janusgraph.core.JanusGraphTransaction;
 import org.janusgraph.core.JanusGraphVertex;
+import org.janusgraph.core.JanusGraphVertexProperty;
 import org.janusgraph.core.log.Change;
 import org.janusgraph.core.log.ChangeProcessor;
 import org.janusgraph.core.log.ChangeState;
@@ -16,9 +17,7 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 /**
  * GraphLogProcessor running inside JanusGraph Server.
@@ -57,6 +56,9 @@ public class GraphLogProcessor {
         if ("TELEMETRY".equalsIgnoreCase(converterType)) {
             converter = new TelemetryMessageConverter();
             logger.info("Using TelemetryMessageConverter");
+        } else if ("SUNBIRD_LEGACY".equalsIgnoreCase(converterType)) {
+            converter = new SunbirdLegacyMessageConverter();
+            logger.info("Using SunbirdLegacyMessageConverter");
         } else {
             converter = new SimpleMessageConverter();
             logger.info("Using SimpleMessageConverter");
@@ -88,11 +90,10 @@ public class GraphLogProcessor {
             LogProcessorFramework framework = JanusGraphFactory.openTransactionLog(graph);
             framework.addLogProcessor(LOG_IDENTIFIER)
                     .setProcessorIdentifier("janusgraph-cdc-processor")
-                    .setStartTime(Instant.now().minus(1, ChronoUnit.DAYS)) // Replay last 24h on first start
+                    .setStartTime(Instant.now().minus(1, ChronoUnit.MINUTES))
                     .addProcessor(new ChangeProcessor() {
                         @Override
                         public void process(JanusGraphTransaction tx, TransactionId txId, ChangeState changeState) {
-                            logger.info("CDC: Received transaction id: {}", txId);
                             try {
                                 processChanges(txId, changeState);
                             } catch (Exception e) {
@@ -111,20 +112,98 @@ public class GraphLogProcessor {
     }
 
     private static void processChanges(TransactionId txId, ChangeState changeState) {
-        // Iterate over specific changes we care about (Vertices)
+        Set<Object> processedIds = new HashSet<>();
+
+        // 1. Process Added Vertices (CREATE)
         for (JanusGraphVertex vertex : changeState.getVertices(Change.ADDED)) {
-            processVertexChange(vertex, "CREATE", txId);
+            processVertexChange(vertex, changeState, "CREATE", txId, null);
+            processedIds.add(vertex.id());
         }
 
+        // 2. Process Removed Vertices (DELETE)
         for (JanusGraphVertex vertex : changeState.getVertices(Change.REMOVED)) {
-            processVertexChange(vertex, "DELETE", txId);
+            processVertexChange(vertex, changeState, "DELETE", txId, null);
+            processedIds.add(vertex.id());
+        }
+
+        // 3. Process Property Updates on Existing Vertices (UPDATE)
+        // JanusGraph registers property updates as REMOVED (old val) and ADDED (new
+        // val) on the same vertex
+        Set<JanusGraphVertex> changedVertices = changeState.getVertices(Change.ANY);
+        for (JanusGraphVertex vertex : changedVertices) {
+            if (!processedIds.contains(vertex.id())) {
+                // Determine if there are actual property diffs
+                Map<String, Map<String, Object>> propertyDiffs = getPropertyDiffs(vertex, changeState);
+                if (!propertyDiffs.isEmpty()) {
+                    processVertexChange(vertex, changeState, "UPDATE", txId, propertyDiffs);
+                }
+            }
         }
     }
 
-    private static void processVertexChange(JanusGraphVertex vertex, String operationType, TransactionId txId) {
+    private static Map<String, Map<String, Object>> getPropertyDiffs(JanusGraphVertex vertex, ChangeState changeState) {
+        Map<String, Map<String, Object>> diffs = new HashMap<>();
+
+        // Capture Removed Properties (Old Values)
+        // usage: getProperties(vertex, change, keys...) - empty keys means all
+        Iterator<JanusGraphVertexProperty> removedProps = changeState
+                .getProperties(vertex, Change.REMOVED).iterator();
+        while (removedProps.hasNext()) {
+            JanusGraphVertexProperty p = removedProps.next();
+            String key = p.key();
+            // Filter system properties if needed
+            if (!isSystemProperty(key)) {
+                diffs.putIfAbsent(key, new HashMap<>());
+                diffs.get(key).put("ov", p.value());
+            }
+        }
+
+        // Capture Added Properties (New Values)
+        Iterator<JanusGraphVertexProperty> addedProps = changeState.getProperties(vertex, Change.ADDED)
+                .iterator();
+        while (addedProps.hasNext()) {
+            JanusGraphVertexProperty p = addedProps.next();
+            String key = p.key();
+            if (!isSystemProperty(key)) {
+                diffs.putIfAbsent(key, new HashMap<>());
+                diffs.get(key).put("nv", p.value());
+            }
+        }
+
+        return diffs;
+    }
+
+    private static boolean isSystemProperty(String key) {
+        // Add any system property filters here
+        return false;
+    }
+
+    private static void processVertexChange(JanusGraphVertex vertex, ChangeState changeState, String operationType,
+            TransactionId txId, Map<String, Map<String, Object>> propertyDiffs) {
         try {
-            // Convert message
-            Map<String, Object> event = converter.convert(vertex, operationType, txId);
+            // Convert message using the Strategy Pattern, but pass diffs for UPDATE
+            Map<String, Object> event;
+
+            // For UPDATE, we manually construct the event to include diffs
+            // Ideally, we should refactor Converter interface to accept diffs,
+            // but for now we patch it here to ensure 'ov' and 'nv' are present.
+            if ("UPDATE".equals(operationType) && propertyDiffs != null) {
+                event = new HashMap<>();
+                event.put("operationType", "UPDATE");
+                event.put("nodeGraphId", "domain"); // Default, should be dynamic if possible
+                event.put("nodeUniqueId", getUniqueId(vertex, changeState));
+                event.put("objectType", vertex.label());
+                event.put("timestamp", System.currentTimeMillis());
+                event.put("txId", txId.toString());
+
+                Map<String, Object> transactionData = new HashMap<>();
+                transactionData.put("properties", propertyDiffs);
+                event.put("transactionData", transactionData);
+            } else {
+                // Fallback to existing converter for CREATE/DELETE
+                event = converter.convert(vertex, changeState, operationType, txId);
+            }
+
             String json = mapper.writeValueAsString(event);
             String key = vertex.id().toString();
 
@@ -141,6 +220,27 @@ public class GraphLogProcessor {
         } catch (Exception e) {
             logger.error("Error converting/processing vertex change event", e);
         }
+    }
+
+    private static String getUniqueId(JanusGraphVertex vertex, ChangeState changeState) {
+        // Try to get IL_UNIQUE_ID
+        try {
+            if (vertex.property("IL_UNIQUE_ID").isPresent()) {
+                return (String) vertex.value("IL_UNIQUE_ID");
+            }
+            // Fallback: check if it was just added in this transaction
+            Iterator<JanusGraphVertexProperty> props = changeState.getProperties(vertex, Change.ADDED)
+                    .iterator();
+            while (props.hasNext()) {
+                JanusGraphVertexProperty p = props.next();
+                if ("IL_UNIQUE_ID".equals(p.key())) {
+                    return (String) p.value();
+                }
+            }
+        } catch (Exception e) {
+            // ignore
+        }
+        return vertex.id().toString();
     }
 
     public static synchronized void shutdown() {
