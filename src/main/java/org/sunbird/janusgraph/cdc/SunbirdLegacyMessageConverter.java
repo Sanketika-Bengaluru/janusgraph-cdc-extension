@@ -8,6 +8,9 @@ import org.janusgraph.core.log.TransactionId;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import java.io.InputStream;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -16,8 +19,35 @@ import java.util.*;
 public class SunbirdLegacyMessageConverter implements MessageConverter {
 
     private static final Logger logger = LoggerFactory.getLogger(SunbirdLegacyMessageConverter.class);
+    private static final ObjectMapper mapper = new ObjectMapper();
     private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSSZ")
             .withZone(ZoneId.systemDefault());
+
+    // Fields that should remain as JSON strings (loaded from config)
+    private static final Set<String> STRING_ONLY_FIELDS = new HashSet<>();
+
+    static {
+        // Load configuration from cdc-converter.conf
+        try (InputStream input = SunbirdLegacyMessageConverter.class.getClassLoader()
+                .getResourceAsStream("cdc-converter.conf")) {
+            if (input != null) {
+                Properties prop = new Properties();
+                prop.load(input);
+                String fields = prop.getProperty("string.only.fields", "");
+                if (!fields.isEmpty()) {
+                    String[] fieldArray = fields.split(",");
+                    for (String field : fieldArray) {
+                        STRING_ONLY_FIELDS.add(field.trim());
+                    }
+                    logger.info("Loaded string-only fields: {}", STRING_ONLY_FIELDS);
+                }
+            } else {
+                logger.warn("cdc-converter.conf not found, no string-only fields configured");
+            }
+        } catch (Exception e) {
+            logger.error("Error loading cdc-converter.conf", e);
+        }
+    }
 
     @Override
     public Map<String, Object> convert(JanusGraphVertex vertex, ChangeState changeState, String operationType,
@@ -49,7 +79,7 @@ public class SunbirdLegacyMessageConverter implements MessageConverter {
             vertex.properties().forEachRemaining(p -> {
                 Map<String, Object> valMap = new HashMap<>();
                 valMap.put("ov", null);
-                valMap.put("nv", p.value());
+                valMap.put("nv", processValue(p.key(), p.value()));
                 propertiesMap.put(p.key(), valMap);
             });
         } else if ("UPDATE".equals(operationType)) {
@@ -59,7 +89,7 @@ public class SunbirdLegacyMessageConverter implements MessageConverter {
                 String key = p.key();
                 processedKeys.add(key);
                 Map<String, Object> valMap = new HashMap<>();
-                valMap.put("nv", p.value());
+                valMap.put("nv", processValue(key, p.value()));
 
                 Object ov = null;
                 try {
@@ -67,7 +97,7 @@ public class SunbirdLegacyMessageConverter implements MessageConverter {
                     Iterator<JanusGraphVertexProperty> removedProps = changeState
                             .getProperties(vertex, Change.REMOVED, key).iterator();
                     if (removedProps.hasNext()) {
-                        ov = removedProps.next().value();
+                        ov = processValue(key, removedProps.next().value());
                     }
                 } catch (Exception e) {
                     // ignore
@@ -84,7 +114,7 @@ public class SunbirdLegacyMessageConverter implements MessageConverter {
                     String key = p.key();
                     if (!processedKeys.contains(key)) {
                         Map<String, Object> valMap = new HashMap<>();
-                        valMap.put("ov", p.value());
+                        valMap.put("ov", processValue(key, p.value()));
                         valMap.put("nv", null);
                         propertiesMap.put(key, valMap);
                     }
@@ -107,7 +137,7 @@ public class SunbirdLegacyMessageConverter implements MessageConverter {
             try {
                 vertex.properties().forEachRemaining(p -> {
                     Map<String, Object> valMap = new HashMap<>();
-                    valMap.put("ov", p.value());
+                    valMap.put("ov", processValue(p.key(), p.value()));
                     valMap.put("nv", null);
                     propertiesMap.put(p.key(), valMap);
                 });
@@ -184,5 +214,30 @@ public class SunbirdLegacyMessageConverter implements MessageConverter {
         if (props.containsKey("createdBy"))
             return (String) props.get("createdBy");
         return "ANONYMOUS";
+    }
+
+    /**
+     * Process property value based on configuration.
+     * Parse JSON strings into objects/arrays for ALL fields EXCEPT those in
+     * STRING_ONLY_FIELDS.
+     */
+    private Object processValue(String key, Object value) {
+        // If field is in STRING_ONLY_FIELDS, keep it as string (don't parse)
+        if (STRING_ONLY_FIELDS.contains(key)) {
+            return value;
+        }
+
+        // For all other fields, try to parse JSON strings
+        if (value instanceof String) {
+            String str = (String) value;
+            try {
+                if ((str.startsWith("{") && str.endsWith("}")) || (str.startsWith("[") && str.endsWith("]"))) {
+                    return mapper.readValue(str, Object.class);
+                }
+            } catch (Exception e) {
+                // Return original string if parsing fails
+            }
+        }
+        return value;
     }
 }

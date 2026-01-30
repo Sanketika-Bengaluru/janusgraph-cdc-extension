@@ -38,16 +38,6 @@ public class GraphLogProcessor {
     private MessageConverter converter;
     private boolean isStarted = false;
 
-    // LRU Cache for timestamp filtering (nodeUniqueId -> lastProcessedTimestamp)
-    private final int CACHE_SIZE = 10000;
-    private final Map<String, Instant> lruCache = Collections
-            .synchronizedMap(new LinkedHashMap<String, Instant>(CACHE_SIZE, 0.75f, true) {
-                @Override
-                protected boolean removeEldestEntry(Map.Entry<String, Instant> eldest) {
-                    return size() > CACHE_SIZE;
-                }
-            });
-
     private GraphLogProcessor() {
         // Prevent direct instantiation
     }
@@ -68,7 +58,7 @@ public class GraphLogProcessor {
 
     private void init(JanusGraph graph, Map<String, Object> config) {
         if (isStarted) {
-            logger.warn("GraphLogProcessor is already running.");
+            logger.info("GraphLogProcessor is already running.");
             return;
         }
 
@@ -225,27 +215,18 @@ public class GraphLogProcessor {
     private void processVertexChange(JanusGraphVertex vertex, ChangeState changeState, String operationType,
             TransactionId txId, Map<String, Map<String, Object>> propertyDiffs) {
         try {
-            // 1. Filter Out-of-Order Events
-            String nodeUniqueId = getUniqueId(vertex, changeState);
-            Instant eventTimestamp = parseTimestampFromTxId(txId.toString());
-
-            if (eventTimestamp != null) {
-                synchronized (lruCache) {
-                    Instant lastProcessed = lruCache.get(nodeUniqueId);
-                    if (lastProcessed != null && eventTimestamp.isBefore(lastProcessed)) {
-                        logger.info("Dropping out-of-order event for node {}. Event Time: {}, Last Processed: {}",
-                                nodeUniqueId, eventTimestamp, lastProcessed);
-                        return; // DROP OLDER EVENT
-                    }
-                    lruCache.put(nodeUniqueId, eventTimestamp);
-                }
-            }
 
             // 2. Convert message using the Strategy Pattern
             // We now delegate all operations (including UPDATE) to the converter.
             // SunbirdLegacyMessageConverter logic has been updated to handle UPDATEs with
             // full snapshots.
             Map<String, Object> event = converter.convert(vertex, changeState, operationType, txId);
+
+            // 3. Filter if status attribute is missing
+            if (!hasStatusAttribute(event)) {
+                logger.debug("Dropping event for node {} as it lacks 'status' attribute.", vertex.id());
+                return;
+            }
 
             String json = mapper.writeValueAsString(event);
             String key = vertex.id().toString();
@@ -265,39 +246,19 @@ public class GraphLogProcessor {
         }
     }
 
-    private Instant parseTimestampFromTxId(String txIdString) {
+    private boolean hasStatusAttribute(Map<String, Object> event) {
         try {
-            // Format: 5@...::2026-01-29T07:36:08.750477Z
-            int separatorIndex = txIdString.lastIndexOf("::");
-            if (separatorIndex != -1) {
-                String timestampStr = txIdString.substring(separatorIndex + 2);
-                return Instant.parse(timestampStr);
-            }
-        } catch (Exception e) {
-            logger.warn("Failed to parse timestamp from txId: {}", txIdString);
-        }
-        return null;
-    }
-
-    private String getUniqueId(JanusGraphVertex vertex, ChangeState changeState) {
-        // Try to get IL_UNIQUE_ID
-        try {
-            if (vertex.property("IL_UNIQUE_ID").isPresent()) {
-                return (String) vertex.value("IL_UNIQUE_ID");
-            }
-            // Fallback: check if it was just added in this transaction
-            Iterator<JanusGraphVertexProperty> props = changeState.getProperties(vertex, Change.ADDED)
-                    .iterator();
-            while (props.hasNext()) {
-                JanusGraphVertexProperty p = props.next();
-                if ("IL_UNIQUE_ID".equals(p.key())) {
-                    return (String) p.value();
+            if (event.containsKey("transactionData")) {
+                Map<String, Object> txData = (Map<String, Object>) event.get("transactionData");
+                if (txData != null && txData.containsKey("properties")) {
+                    Map<String, Object> props = (Map<String, Object>) txData.get("properties");
+                    return props != null && props.containsKey("status");
                 }
             }
         } catch (Exception e) {
             // ignore
         }
-        return vertex.id().toString();
+        return false;
     }
 
 }
