@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: janusgraph-cdc
+  labels:
+    app: janusgraph-cdc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: janusgraph-cdc
+  template:
+    metadata:
+      labels:
+        app: janusgraph-cdc
+    spec:
+      containers:
+        - name: janusgraph
+          image: janusgraph-cdc-extension:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8182
+              name: gremlin
+            - containerPort: 9042
+              name: cql
+          env:
+            - name: JANUSGRAPH_LOG_DIR
+              value: "/tmp"
+          volumeMounts:
+            - name: config-volume
+              mountPath: /opt/janusgraph/conf/log4j2-server.xml
+              subPath: log4j2-server.xml
+            - name: config-volume
+              mountPath: /opt/janusgraph/conf/cdc-log4j.properties
+              subPath: cdc-log4j.properties
+      volumes:
+        - name: config-volume
+          configMap:
+            name: janusgraph-cdc-config

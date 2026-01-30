@@ -5,8 +5,8 @@
             <PatternLayout pattern="%d{HH:mm:ss} %-5level %class.%method{36} - %msg%n"/>
         </Console>
         <!-- CDC Appender -->
-        <RollingFile name="CDC_LOG" fileName="/opt/janusgraph/logs/cdc-events.log"
-                     filePattern="/opt/janusgraph/logs/cdc-events-%d{yyyy-MM-dd}.log.gz">
+        <RollingFile name="CDC_LOG" fileName="${sys:janusgraph.log.dir:-/tmp}/cdc-events.log"
+                     filePattern="${sys:janusgraph.log.dir:-/tmp}/cdc-events-%d{yyyy-MM-dd}.log.gz">
             <PatternLayout pattern="%d{ISO8601} %msg%n"/>
             <Policies>
                 <TimeBasedTriggeringPolicy />

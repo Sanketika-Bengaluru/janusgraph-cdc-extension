@@ -53,24 +53,45 @@ public class SunbirdLegacyMessageConverter implements MessageConverter {
                 propertiesMap.put(p.key(), valMap);
             });
         } else if ("UPDATE".equals(operationType)) {
+            Set<String> processedKeys = new HashSet<>();
+            // 1. Process current properties (Added or Updated)
             vertex.properties().forEachRemaining(p -> {
+                String key = p.key();
+                processedKeys.add(key);
                 Map<String, Object> valMap = new HashMap<>();
+                valMap.put("nv", p.value());
+
                 Object ov = null;
                 try {
-                    // Fetch the removed property with the same key for this vertex
-                    // This represents the old value
+                    // Fetch the removed property with the same key which represents the old value
                     Iterator<JanusGraphVertexProperty> removedProps = changeState
-                            .getProperties(vertex, Change.REMOVED, p.key()).iterator();
+                            .getProperties(vertex, Change.REMOVED, key).iterator();
                     if (removedProps.hasNext()) {
                         ov = removedProps.next().value();
                     }
                 } catch (Exception e) {
-                    logger.debug("Failed to fetch old value for key {}", p.key());
+                    // ignore
                 }
                 valMap.put("ov", ov);
-                valMap.put("nv", p.value());
-                propertiesMap.put(p.key(), valMap);
+                propertiesMap.put(key, valMap);
             });
+
+            // 2. Process removed properties (Deleted)
+            // If a key is in REMOVED but was not in current vertex properties, it was
+            // deleted.
+            try {
+                changeState.getProperties(vertex, Change.REMOVED).iterator().forEachRemaining(p -> {
+                    String key = p.key();
+                    if (!processedKeys.contains(key)) {
+                        Map<String, Object> valMap = new HashMap<>();
+                        valMap.put("ov", p.value());
+                        valMap.put("nv", null);
+                        propertiesMap.put(key, valMap);
+                    }
+                });
+            } catch (Exception e) {
+                logger.warn("Error processing removed properties for vertex {}", vertex.id(), e);
+            }
         } else if ("DELETE".equals(operationType)) {
             // In DELETE, changeState might provide REMOVED properties, or we access what we
             // can

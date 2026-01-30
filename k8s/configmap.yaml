@@ -1,0 +1,50 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: janusgraph-cdc-config
+data:
+  cdc-log4j.properties: |
+    # Logger for the CDC LogFileEventSink
+    log4j.logger.org.sunbird.janusgraph.cdc.LogFileEventSink=INFO, cdcLog
+    log4j.additivity.org.sunbird.janusgraph.cdc.LogFileEventSink=false
+
+    # Appender configuration
+    log4j.appender.cdcLog=org.apache.log4j.RollingFileAppender
+    log4j.appender.cdcLog.File=${janusgraph.log.dir}/janusgraph-cdc-events.log
+    log4j.appender.cdcLog.MaxFileSize=100MB
+    log4j.appender.cdcLog.MaxBackupIndex=10
+    log4j.appender.cdcLog.layout=org.apache.log4j.PatternLayout
+    log4j.appender.cdcLog.layout.ConversionPattern=%d{ISO8601} %m%n
+
+  log4j2-server.xml: |
+    <?xml version="1.0" encoding="UTF-8"?>
+    <Configuration status="warn">
+        <Appenders>
+            <Console name="STDOUT" target="SYSTEM_OUT">
+                <PatternLayout pattern="%d{HH:mm:ss} %-5level %class.%method{36} - %msg%n"/>
+            </Console>
+            <!-- CDC Appender -->
+            <RollingFile name="CDC_LOG" fileName="${sys:janusgraph.log.dir:-/tmp}/cdc-events.log"
+                         filePattern="${sys:janusgraph.log.dir:-/tmp}/cdc-events-%d{yyyy-MM-dd}.log.gz">
+                <PatternLayout pattern="%d{ISO8601} %msg%n"/>
+                <Policies>
+                    <TimeBasedTriggeringPolicy />
+                    <SizeBasedTriggeringPolicy size="100 MB"/>
+                </Policies>
+            </RollingFile>
+        </Appenders>
+        <Loggers>
+            <Logger name="org.apache.hadoop.hbase" level="warn">
+                <AppenderRef ref="STDOUT"/>
+            </Logger>
+            
+            <!-- CDC Logger -->
+            <Logger name="org.sunbird.janusgraph.cdc.LogFileEventSink" level="info" additivity="false">
+                <AppenderRef ref="CDC_LOG"/>
+            </Logger>
+    
+            <Root level="info">
+                <AppenderRef ref="STDOUT"/>
+            </Root>
+        </Loggers>
+    </Configuration>

@@ -30,12 +30,43 @@ public class GraphLogProcessor {
     private static final String LOG_IDENTIFIER = "learning_graph_events";
     private static final ObjectMapper mapper = new ObjectMapper();
 
-    // Configurable components
-    private static List<EventSink> sinks = new ArrayList<>();
-    private static MessageConverter converter;
-    private static boolean isStarted = false;
+    // Singleton instance
+    private static volatile GraphLogProcessor instance;
+
+    // Instance State
+    private List<EventSink> sinks = new ArrayList<>();
+    private MessageConverter converter;
+    private boolean isStarted = false;
+
+    // LRU Cache for timestamp filtering (nodeUniqueId -> lastProcessedTimestamp)
+    private final int CACHE_SIZE = 10000;
+    private final Map<String, Instant> lruCache = Collections
+            .synchronizedMap(new LinkedHashMap<String, Instant>(CACHE_SIZE, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, Instant> eldest) {
+                    return size() > CACHE_SIZE;
+                }
+            });
+
+    private GraphLogProcessor() {
+        // Prevent direct instantiation
+    }
 
     public static synchronized void start(JanusGraph graph, Map<String, Object> config) {
+        if (instance == null) {
+            instance = new GraphLogProcessor();
+        }
+        instance.init(graph, config);
+    }
+
+    public static synchronized void shutdown() {
+        if (instance != null) {
+            instance.stop();
+            instance = null;
+        }
+    }
+
+    private void init(JanusGraph graph, Map<String, Object> config) {
         if (isStarted) {
             logger.warn("GraphLogProcessor is already running.");
             return;
@@ -111,7 +142,20 @@ public class GraphLogProcessor {
         }
     }
 
-    private static void processChanges(TransactionId txId, ChangeState changeState) {
+    private void stop() {
+        for (EventSink sink : sinks) {
+            try {
+                sink.close();
+            } catch (Exception e) {
+                logger.warn("Error closing sink", e);
+            }
+        }
+        sinks.clear();
+        isStarted = false;
+        logger.info("GraphLogProcessor stopped.");
+    }
+
+    private void processChanges(TransactionId txId, ChangeState changeState) {
         Set<Object> processedIds = new HashSet<>();
 
         // 1. Process Added Vertices (CREATE)
@@ -141,7 +185,7 @@ public class GraphLogProcessor {
         }
     }
 
-    private static Map<String, Map<String, Object>> getPropertyDiffs(JanusGraphVertex vertex, ChangeState changeState) {
+    private Map<String, Map<String, Object>> getPropertyDiffs(JanusGraphVertex vertex, ChangeState changeState) {
         Map<String, Map<String, Object>> diffs = new HashMap<>();
 
         // Capture Removed Properties (Old Values)
@@ -173,36 +217,35 @@ public class GraphLogProcessor {
         return diffs;
     }
 
-    private static boolean isSystemProperty(String key) {
+    private boolean isSystemProperty(String key) {
         // Add any system property filters here
         return false;
     }
 
-    private static void processVertexChange(JanusGraphVertex vertex, ChangeState changeState, String operationType,
+    private void processVertexChange(JanusGraphVertex vertex, ChangeState changeState, String operationType,
             TransactionId txId, Map<String, Map<String, Object>> propertyDiffs) {
         try {
-            // Convert message using the Strategy Pattern, but pass diffs for UPDATE
-            Map<String, Object> event;
+            // 1. Filter Out-of-Order Events
+            String nodeUniqueId = getUniqueId(vertex, changeState);
+            Instant eventTimestamp = parseTimestampFromTxId(txId.toString());
 
-            // For UPDATE, we manually construct the event to include diffs
-            // Ideally, we should refactor Converter interface to accept diffs,
-            // but for now we patch it here to ensure 'ov' and 'nv' are present.
-            if ("UPDATE".equals(operationType) && propertyDiffs != null) {
-                event = new HashMap<>();
-                event.put("operationType", "UPDATE");
-                event.put("nodeGraphId", "domain"); // Default, should be dynamic if possible
-                event.put("nodeUniqueId", getUniqueId(vertex, changeState));
-                event.put("objectType", vertex.label());
-                event.put("timestamp", System.currentTimeMillis());
-                event.put("txId", txId.toString());
-
-                Map<String, Object> transactionData = new HashMap<>();
-                transactionData.put("properties", propertyDiffs);
-                event.put("transactionData", transactionData);
-            } else {
-                // Fallback to existing converter for CREATE/DELETE
-                event = converter.convert(vertex, changeState, operationType, txId);
+            if (eventTimestamp != null) {
+                synchronized (lruCache) {
+                    Instant lastProcessed = lruCache.get(nodeUniqueId);
+                    if (lastProcessed != null && eventTimestamp.isBefore(lastProcessed)) {
+                        logger.info("Dropping out-of-order event for node {}. Event Time: {}, Last Processed: {}",
+                                nodeUniqueId, eventTimestamp, lastProcessed);
+                        return; // DROP OLDER EVENT
+                    }
+                    lruCache.put(nodeUniqueId, eventTimestamp);
+                }
             }
+
+            // 2. Convert message using the Strategy Pattern
+            // We now delegate all operations (including UPDATE) to the converter.
+            // SunbirdLegacyMessageConverter logic has been updated to handle UPDATEs with
+            // full snapshots.
+            Map<String, Object> event = converter.convert(vertex, changeState, operationType, txId);
 
             String json = mapper.writeValueAsString(event);
             String key = vertex.id().toString();
@@ -222,7 +265,21 @@ public class GraphLogProcessor {
         }
     }
 
-    private static String getUniqueId(JanusGraphVertex vertex, ChangeState changeState) {
+    private Instant parseTimestampFromTxId(String txIdString) {
+        try {
+            // Format: 5@...::2026-01-29T07:36:08.750477Z
+            int separatorIndex = txIdString.lastIndexOf("::");
+            if (separatorIndex != -1) {
+                String timestampStr = txIdString.substring(separatorIndex + 2);
+                return Instant.parse(timestampStr);
+            }
+        } catch (Exception e) {
+            logger.warn("Failed to parse timestamp from txId: {}", txIdString);
+        }
+        return null;
+    }
+
+    private String getUniqueId(JanusGraphVertex vertex, ChangeState changeState) {
         // Try to get IL_UNIQUE_ID
         try {
             if (vertex.property("IL_UNIQUE_ID").isPresent()) {
@@ -243,16 +300,4 @@ public class GraphLogProcessor {
         return vertex.id().toString();
     }
 
-    public static synchronized void shutdown() {
-        for (EventSink sink : sinks) {
-            try {
-                sink.close();
-            } catch (Exception e) {
-                logger.warn("Error closing sink", e);
-            }
-        }
-        sinks.clear();
-        isStarted = false;
-        logger.info("GraphLogProcessor stopped.");
-    }
 }

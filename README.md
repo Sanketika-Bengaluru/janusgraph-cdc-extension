@@ -24,7 +24,7 @@ The JanusGraph CDC (Change Data Capture) Log Processor is a **standalone JAR** t
 ## Prerequisites
 
 - JanusGraph Server 1.1.0 (running in Docker)
-- Kafka (accessible from JanusGraph container)
+- Kafka (Optional - only if using KAFKA sink)
 - Maven (for building the JAR)
 - Application using JanusGraph
 
@@ -111,12 +111,12 @@ You can modify the configuration map in the script:
 
 ```groovy
 Map<String, Object> config = new HashMap<>();
-// Sinks: KAFKA, LOG
-config.put("graph.txn.log_processor.sinks", "KAFKA,LOG"); 
+// Sinks: LOG (File only)
+config.put("graph.txn.log_processor.sinks", "LOG"); 
 // Converter: TELEMETRY (Custom), DEFAULT (Legacy)
 config.put("graph.txn.log_processor.converter", "TELEMETRY"); 
-config.put("kafka.bootstrap.servers", "localhost:9092");
-config.put("kafka.topics.graph.event", "sunbirddev.learning.graph.events");
+// config.put("kafka.bootstrap.servers", "localhost:9092");
+// config.put("kafka.topics.graph.event", "sunbirddev.learning.graph.events");
 
 GraphLogProcessor.start(graphInstance, config);
 ```
