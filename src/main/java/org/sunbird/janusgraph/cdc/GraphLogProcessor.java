@@ -16,8 +16,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
+import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
+import java.util.concurrent.*;
+import java.util.stream.Collectors;
 
 /**
  * GraphLogProcessor running inside JanusGraph Server.
@@ -37,6 +40,35 @@ public class GraphLogProcessor {
     private List<EventSink> sinks = new ArrayList<>();
     private MessageConverter converter;
     private boolean isStarted = false;
+
+    // LRU Cache for timestamp-based deduplication (nodeUniqueId ->
+    // lastProcessedTimestamp)
+    private Map<String, Instant> lastProcessedTimestamps = new LinkedHashMap<String, Instant>(1000, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, Instant> eldest) {
+            return size() > 1000;
+        }
+    };
+
+    // Event buffering for merging
+    private Map<String, List<BufferedEvent>> eventBuffer = new ConcurrentHashMap<>();
+    private long bufferWindowMs = 1000; // 1 second default
+    private ScheduledExecutorService scheduler;
+
+    /**
+     * Buffered event with timestamp information
+     */
+    private static class BufferedEvent {
+        Map<String, Object> event;
+        Instant lastUpdatedOn;
+        Instant receivedAt;
+
+        BufferedEvent(Map<String, Object> event, Instant lastUpdatedOn) {
+            this.event = event;
+            this.lastUpdatedOn = lastUpdatedOn;
+            this.receivedAt = Instant.now();
+        }
+    }
 
     private GraphLogProcessor() {
         // Prevent direct instantiation
@@ -124,6 +156,15 @@ public class GraphLogProcessor {
                     })
                     .build();
 
+            // Configure buffer window
+            if (config.containsKey("eventBufferWindowMs")) {
+                bufferWindowMs = ((Number) config.get("eventBufferWindowMs")).longValue();
+            }
+            logger.info("Event buffer window set to {}ms", bufferWindowMs);
+
+            // Start buffer flusher
+            startBufferFlusher();
+
             isStarted = true;
             logger.info("GraphLogProcessor started successfully with {} sinks.", sinks.size());
 
@@ -133,6 +174,22 @@ public class GraphLogProcessor {
     }
 
     private void stop() {
+        // Stop scheduler and flush remaining events
+        if (scheduler != null && !scheduler.isShutdown()) {
+            scheduler.shutdown();
+            try {
+                if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
+                    scheduler.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                scheduler.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        // Flush any remaining buffered events
+        flushAllBufferedEvents();
+
         for (EventSink sink : sinks) {
             try {
                 sink.close();
@@ -222,16 +279,52 @@ public class GraphLogProcessor {
             // full snapshots.
             Map<String, Object> event = converter.convert(vertex, changeState, operationType, txId);
 
-            // 3. Filter if status attribute is missing
+            // 3. Filter based on lastUpdatedOn timestamp (skip older events)
+            String nodeUniqueId = (String) event.get("nodeUniqueId");
+            Instant currentTimestamp = getLastUpdatedOn(event);
+
+            if (nodeUniqueId != null && currentTimestamp != null) {
+                Instant lastProcessed = lastProcessedTimestamps.get(nodeUniqueId);
+                if (lastProcessed != null && !currentTimestamp.isAfter(lastProcessed)) {
+                    logger.info("Skipping older/duplicate event for node {} (current: {}, last processed: {})",
+                            nodeUniqueId, currentTimestamp, lastProcessed);
+                    return;
+                }
+                logger.info("Processing event for node {} with timestamp {} (last processed: {})",
+                        nodeUniqueId, currentTimestamp, lastProcessed);
+            } else {
+                logger.warn("Cannot perform timestamp filtering for node {} (nodeUniqueId: {}, timestamp: {})",
+                        vertex.id(), nodeUniqueId, currentTimestamp);
+            }
+
+            // 4. Filter if status attribute is missing
             if (!hasStatusAttribute(event)) {
                 logger.debug("Dropping event for node {} as it lacks 'status' attribute.", vertex.id());
                 return;
             }
 
-            String json = mapper.writeValueAsString(event);
-            String key = vertex.id().toString();
+            // 5. Buffer event for merging (instead of sending immediately)
+            if (nodeUniqueId != null && currentTimestamp != null) {
+                BufferedEvent bufferedEvent = new BufferedEvent(event, currentTimestamp);
+                eventBuffer.computeIfAbsent(nodeUniqueId, k -> new CopyOnWriteArrayList<>()).add(bufferedEvent);
+                logger.debug("Buffered event for node {} with timestamp {}", nodeUniqueId, currentTimestamp);
+            } else {
+                // If we can't extract timestamp, send immediately (fallback)
+                logger.warn("Cannot buffer event for node {}, sending immediately", vertex.id());
+                sendEventToSinks(vertex.id().toString(), event);
+            }
 
-            // Send to all sinks
+        } catch (Exception e) {
+            logger.error("Error converting/processing vertex change event", e);
+        }
+    }
+
+    /**
+     * Send event to all configured sinks
+     */
+    private void sendEventToSinks(String key, Map<String, Object> event) {
+        try {
+            String json = mapper.writeValueAsString(event);
             for (EventSink sink : sinks) {
                 try {
                     sink.send(key, json);
@@ -239,10 +332,9 @@ public class GraphLogProcessor {
                     logger.error("Error sending event to sink: {}", sink.getClass().getSimpleName(), e);
                 }
             }
-            logger.debug("Processed event: {}", json);
-
+            logger.debug("Sent event: {}", json);
         } catch (Exception e) {
-            logger.error("Error converting/processing vertex change event", e);
+            logger.error("Error serializing event", e);
         }
     }
 
@@ -261,4 +353,175 @@ public class GraphLogProcessor {
         return false;
     }
 
+    /**
+     * Extract lastUpdatedOn timestamp from event for deduplication.
+     */
+    private Instant getLastUpdatedOn(Map<String, Object> event) {
+        try {
+            if (event.containsKey("transactionData")) {
+                Map<String, Object> txData = (Map<String, Object>) event.get("transactionData");
+                if (txData != null && txData.containsKey("properties")) {
+                    Map<String, Object> props = (Map<String, Object>) txData.get("properties");
+                    if (props != null && props.containsKey("lastUpdatedOn")) {
+                        Map<String, Object> lastUpdatedOnMap = (Map<String, Object>) props.get("lastUpdatedOn");
+                        if (lastUpdatedOnMap != null) {
+                            String timestamp = (String) lastUpdatedOnMap.get("nv");
+                            if (timestamp != null) {
+                                return Instant.parse(timestamp.replace("+0000", "Z"));
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.debug("Could not extract lastUpdatedOn timestamp", e);
+        }
+        return null;
+    }
+
+    /**
+     * Start scheduled thread to flush expired buffered events
+     */
+    private void startBufferFlusher() {
+        scheduler = Executors.newScheduledThreadPool(1);
+        scheduler.scheduleAtFixedRate(() -> {
+            try {
+                flushExpiredEvents();
+            } catch (Exception e) {
+                logger.error("Error flushing buffered events", e);
+            }
+        }, 100, 100, TimeUnit.MILLISECONDS);
+        logger.info("Buffer flusher started (check interval: 100ms)");
+    }
+
+    /**
+     * Flush events that have been buffered longer than the window
+     */
+    private void flushExpiredEvents() {
+        Instant now = Instant.now();
+        List<String> keysToFlush = new ArrayList<>();
+
+        for (Map.Entry<String, List<BufferedEvent>> entry : eventBuffer.entrySet()) {
+            String nodeUniqueId = entry.getKey();
+            List<BufferedEvent> events = entry.getValue();
+
+            if (!events.isEmpty()) {
+                BufferedEvent oldest = events.get(0);
+                long ageMs = now.toEpochMilli() - oldest.receivedAt.toEpochMilli();
+
+                if (ageMs >= bufferWindowMs) {
+                    keysToFlush.add(nodeUniqueId);
+                }
+            }
+        }
+
+        for (String key : keysToFlush) {
+            flushBufferedEvents(key);
+        }
+    }
+
+    /**
+     * Flush all buffered events (called during shutdown)
+     */
+    private void flushAllBufferedEvents() {
+        logger.info("Flushing all buffered events...");
+        for (String nodeUniqueId : new ArrayList<>(eventBuffer.keySet())) {
+            flushBufferedEvents(nodeUniqueId);
+        }
+    }
+
+    /**
+     * Merge and send buffered events for a specific node
+     */
+    private void flushBufferedEvents(String nodeUniqueId) {
+        List<BufferedEvent> events = eventBuffer.remove(nodeUniqueId);
+        if (events == null || events.isEmpty()) {
+            return;
+        }
+
+        if (events.size() == 1) {
+            // Single event, send as-is
+            BufferedEvent buffered = events.get(0);
+            sendEventToSinks(nodeUniqueId, buffered.event);
+            lastProcessedTimestamps.put(nodeUniqueId, buffered.lastUpdatedOn);
+        } else {
+            // Multiple events, merge them
+            logger.info("Merging {} events for node {}", events.size(), nodeUniqueId);
+            Map<String, Object> mergedEvent = mergeEvents(events);
+
+            // Use the latest timestamp
+            Instant latestTimestamp = events.stream()
+                    .map(e -> e.lastUpdatedOn)
+                    .max(Instant::compareTo)
+                    .orElse(Instant.now());
+
+            sendEventToSinks(nodeUniqueId, mergedEvent);
+            lastProcessedTimestamps.put(nodeUniqueId, latestTimestamp);
+        }
+    }
+
+    /**
+     * Merge multiple events into a single event with the latest values
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> mergeEvents(List<BufferedEvent> events) {
+        // Sort by lastUpdatedOn (oldest to newest)
+        events.sort(Comparator.comparing(e -> e.lastUpdatedOn));
+
+        // Start with the first event as base
+        Map<String, Object> merged = new HashMap<>(events.get(0).event);
+
+        // Merge properties from subsequent events
+        for (int i = 1; i < events.size(); i++) {
+            Map<String, Object> event = events.get(i).event;
+
+            // Merge transactionData.properties
+            if (event.containsKey("transactionData") && merged.containsKey("transactionData")) {
+                Map<String, Object> eventTxData = (Map<String, Object>) event.get("transactionData");
+                Map<String, Object> mergedTxData = (Map<String, Object>) merged.get("transactionData");
+
+                if (eventTxData.containsKey("properties") && mergedTxData.containsKey("properties")) {
+                    Map<String, Object> eventProps = (Map<String, Object>) eventTxData.get("properties");
+                    Map<String, Object> mergedProps = (Map<String, Object>) mergedTxData.get("properties");
+
+                    // For each property in the newer event
+                    for (Map.Entry<String, Object> propEntry : eventProps.entrySet()) {
+                        String propKey = propEntry.getKey();
+                        Map<String, Object> newPropValue = (Map<String, Object>) propEntry.getValue();
+
+                        // Check if this property actually changed by comparing with previous event
+                        boolean shouldUpdate = false;
+
+                        if (!mergedProps.containsKey(propKey)) {
+                            // New property, add it
+                            shouldUpdate = true;
+                        } else {
+                            // Property exists in previous event, check if value changed
+                            Map<String, Object> oldPropValue = (Map<String, Object>) mergedProps.get(propKey);
+                            Object oldNv = oldPropValue.get("nv");
+                            Object newNv = newPropValue.get("nv");
+
+                            // Update if the nv value is different
+                            if (!Objects.equals(oldNv, newNv)) {
+                                shouldUpdate = true;
+                            }
+                        }
+
+                        if (shouldUpdate) {
+                            mergedProps.put(propKey, newPropValue);
+                        }
+                        // Otherwise, keep the existing value from the previous event
+                    }
+                }
+            }
+
+            // Update top-level fields from latest event
+            merged.put("ets", event.get("ets"));
+            merged.put("mid", event.get("mid"));
+            merged.put("label", event.get("label"));
+            merged.put("createdOn", event.get("createdOn"));
+        }
+
+        return merged;
+    }
 }

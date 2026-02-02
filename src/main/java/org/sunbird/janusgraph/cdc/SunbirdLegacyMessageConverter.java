@@ -84,31 +84,34 @@ public class SunbirdLegacyMessageConverter implements MessageConverter {
             });
         } else if ("UPDATE".equals(operationType)) {
             Set<String> processedKeys = new HashSet<>();
-            // 1. Process current properties (Added or Updated)
-            vertex.properties().forEachRemaining(p -> {
-                String key = p.key();
-                processedKeys.add(key);
-                Map<String, Object> valMap = new HashMap<>();
-                valMap.put("nv", processValue(key, p.value()));
 
-                Object ov = null;
-                try {
-                    // Fetch the removed property with the same key which represents the old value
-                    Iterator<JanusGraphVertexProperty> removedProps = changeState
-                            .getProperties(vertex, Change.REMOVED, key).iterator();
-                    if (removedProps.hasNext()) {
-                        ov = processValue(key, removedProps.next().value());
+            // 1. Process ADDED properties (new or updated values)
+            try {
+                changeState.getProperties(vertex, Change.ADDED).iterator().forEachRemaining(p -> {
+                    String key = p.key();
+                    processedKeys.add(key);
+                    Map<String, Object> valMap = new HashMap<>();
+                    valMap.put("nv", processValue(key, p.value()));
+
+                    Object ov = null;
+                    try {
+                        // Fetch the removed property with the same key which represents the old value
+                        Iterator<JanusGraphVertexProperty> removedProps = changeState
+                                .getProperties(vertex, Change.REMOVED, key).iterator();
+                        if (removedProps.hasNext()) {
+                            ov = processValue(key, removedProps.next().value());
+                        }
+                    } catch (Exception e) {
+                        // ignore
                     }
-                } catch (Exception e) {
-                    // ignore
-                }
-                valMap.put("ov", ov);
-                propertiesMap.put(key, valMap);
-            });
+                    valMap.put("ov", ov);
+                    propertiesMap.put(key, valMap);
+                });
+            } catch (Exception e) {
+                logger.warn("Error processing added properties for vertex {}", vertex.id(), e);
+            }
 
-            // 2. Process removed properties (Deleted)
-            // If a key is in REMOVED but was not in current vertex properties, it was
-            // deleted.
+            // 2. Process REMOVED properties (deleted properties not in ADDED)
             try {
                 changeState.getProperties(vertex, Change.REMOVED).iterator().forEachRemaining(p -> {
                     String key = p.key();
@@ -122,6 +125,18 @@ public class SunbirdLegacyMessageConverter implements MessageConverter {
             } catch (Exception e) {
                 logger.warn("Error processing removed properties for vertex {}", vertex.id(), e);
             }
+
+            // 3. Add ALL current vertex properties (complete snapshot)
+            // This ensures every UPDATE event has the complete current state
+            vertex.properties().forEachRemaining(p -> {
+                String key = p.key();
+                if (!processedKeys.contains(key)) {
+                    Map<String, Object> valMap = new HashMap<>();
+                    valMap.put("nv", processValue(key, p.value()));
+                    valMap.put("ov", null); // Unchanged property
+                    propertiesMap.put(key, valMap);
+                }
+            });
         } else if ("DELETE".equals(operationType)) {
             // In DELETE, changeState might provide REMOVED properties, or we access what we
             // can
